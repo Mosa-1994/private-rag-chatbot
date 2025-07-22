@@ -355,8 +355,10 @@ ANTWOORD:
                     avg_content_length = np.mean([len(doc['content']) for doc in documents])
                     st.metric("Gem. artikel lengte", f"{avg_content_length:.0f} chars")
                     
+                    else:
+                        st.error(result_msg)
                 else:
-                    st.error(result_msg)
+                    st.info("✅ Bestand al verwerkt")
             
             # Status check (DEBUG info)
             st.subheader("🔍 Debug Status")
