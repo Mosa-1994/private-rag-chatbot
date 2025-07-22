@@ -7,468 +7,325 @@ from typing import List, Dict, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-# LlamaIndex imports - alleen wat je gebruikt
-from llama_index.core import VectorStoreIndex, Document, Settings
+# LlamaIndex en SentenceTransformer imports
 from llama_index.llms.groq import Groq
 from sentence_transformers import SentenceTransformer
 
 
 class StreamlitCompatibleRAG:
-    """RAG Chatbot compatible met Streamlit Cloud (geen ChromaDB)"""
-    
+    """
+    RAG Chatbot geoptimaliseerd voor Streamlit Cloud.
+    - Gebruikt in-memory vector search met NumPy voor snelheid.
+    - Geen schijfafhankelijkheden (zoals ChromaDB/SQLite).
+    - State management via st.session_state voor een naadloze ervaring.
+    - Focus op privacy met lokale embeddings en content filtering.
+    """
+
+    # --- Configuratie Constanten ---
+    LLM_MODEL = "llama3-70b-8192"
+    EMBEDDING_MODEL = 'sentence-transformers/distiluse-base-multilingual-cased'
+    SIMILARITY_THRESHOLD = 0.3  # Drempelwaarde om bronnen te tonen
+
     def __init__(self):
+        """Initialiseer de applicatie en de benodigde componenten."""
         self.setup_page_config()
-        self.initialize_components()
-        self.documents_data = []  # Store voor document data
-        self.embeddings_cache = {}  # Cache voor embeddings
-    
+        self.llm, self.embedder = self.initialize_components()
+
+        # Gebruik st.session_state als de 'single source of truth'
+        self.documents_data = st.session_state.get('documents_data', [])
+
     def setup_page_config(self):
-        """Streamlit pagina configuratie"""
+        """Configureer de Streamlit pagina."""
         st.set_page_config(
             page_title="🔒 Private Kennisbank Chat",
             page_icon="🔒",
             layout="wide",
             initial_sidebar_state="expanded"
         )
-    
-    def initialize_components(self):
-        """Initialize LLM en embedding components"""
+
+    @st.cache_resource
+    def initialize_components(_self):
+        """
+        Initialiseer en cache de zware componenten (LLM en embedder).
+        Gebruik @_self omdat @st.cache_resource geen 'self' accepteert.
+        """
         try:
-            # Groq LLM setup
             groq_api_key = st.secrets.get("GROQ_API_KEY")
             if not groq_api_key:
                 st.error("❌ GROQ_API_KEY niet gevonden in Streamlit secrets!")
                 st.stop()
-            
-            self.llm = Groq(
-                model="llama3-70b-8192",
+
+            llm = Groq(
+                model=_self.LLM_MODEL,
                 api_key=groq_api_key,
                 temperature=0.1
             )
             
-            # Lokale sentence transformer voor embeddings
-            self.embedder = SentenceTransformer(
-                'sentence-transformers/distiluse-base-multilingual-cased'
-            )
+            embedder = SentenceTransformer(_self.EMBEDDING_MODEL)
             
-            st.success("✅ Systeem succesvol geïnitialiseerd (ChromaDB-vrij)!")
-            
+            st.toast("✅ Systeemcomponenten succesvol geladen!", icon="🚀")
+            return llm, embedder
+
         except Exception as e:
-            st.error(f"❌ Fout bij initialisatie: {str(e)}")
+            st.error(f"❌ Kritieke fout bij initialisatie: {str(e)}")
             st.stop()
-    
+
     def check_access_control(self) -> bool:
-        """Controleer toegang tot de applicatie"""
-        access_password = st.secrets.get("access_password", "")
-        
+        """Controleer de toegang tot de applicatie via een wachtwoord."""
+        access_password = st.secrets.get("access_password")
         if not access_password:
-            return True  # Geen toegangscontrole
-        
+            return True  # Geen wachtwoord ingesteld, toegang verleend
+
         if 'authenticated' not in st.session_state:
-            st.title("🔒 Toegang Vereist")
-            
-            with st.form("login_form"):
-                password = st.text_input("Wachtwoord:", type="password")
-                submit = st.form_submit_button("Inloggen")
-                
-                if submit:
-                    if password == access_password:
-                        st.session_state['authenticated'] = True
-                        st.success("✅ Toegang verleend!")
-                        st.rerun()
-                    else:
-                        st.error("❌ Onjuist wachtwoord")
-            
-            st.info("💡 Neem contact op met de beheerder voor toegang.")
-            return False
+            st.session_state['authenticated'] = False
+
+        if st.session_state['authenticated']:
+            return True
+
+        st.title("🔒 Toegang Vereist")
+        with st.form("login_form"):
+            password = st.text_input("Wachtwoord:", type="password")
+            submit = st.form_submit_button("Inloggen")
+
+            if submit:
+                if password == access_password:
+                    st.session_state['authenticated'] = True
+                    st.success("✅ Toegang verleend!")
+                    st.rerun()
+                else:
+                    st.error("❌ Onjuist wachtwoord")
         
-        return True
-    
+        st.info("💡 Neem contact op met de beheerder voor toegang.")
+        return False
+
     def sanitize_content(self, content: str) -> str:
-        """Verwijder gevoelige informatie uit content"""
+        """Verwijder basis gevoelige informatie uit content met regex."""
         if not content:
             return ""
-        
-        # Email adressen
         content = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL]', content)
-        
-        # Telefoonnummers
         content = re.sub(r'\b(?:\+31|0031|0)[0-9]{8,9}\b', '[TELEFOON]', content)
-        
-        # URLs
         content = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '[URL]', content)
-        
-        # IP adressen
         content = re.sub(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', '[IP]', content)
-        
         return content
-    
-    def process_uploaded_documents(self, uploaded_file) -> tuple[List[Dict], str]:
-        """Verwerk uploaded JSON bestand"""
+
+    def process_uploaded_documents(self, uploaded_file):
+        """Verwerk een geüpload JSON-bestand, maak embeddings en sla op in session_state."""
         try:
             file_hash = hashlib.md5(uploaded_file.name.encode()).hexdigest()[:8]
             raw_data = json.loads(uploaded_file.getvalue())
-            
+
             if not isinstance(raw_data, list):
-                return [], "❌ JSON moet een lijst van documenten zijn"
-            
+                st.error("❌ JSON moet een lijst van document-objecten zijn.")
+                return
+
             documents = []
-            processed_count = 0
-            
-            # Progress bar
-            progress_bar = st.progress(0)
-            
+            progress_bar = st.progress(0, "Verwerken van documenten...")
+
             for i, item in enumerate(raw_data):
                 try:
                     title = item.get('title', f'Document {i+1}')
-                    content = item.get('content', '')
-                    category = item.get('category', 'Algemeen')
-                    audience = item.get('audience', 'Algemeen')
-                    tags = item.get('tags', [])
+                    content = self.sanitize_content(item.get('content', ''))
+                    full_text = f"Titel: {title}. Inhoud: {content}"
                     
-                    # Sanitize content
-                    clean_content = self.sanitize_content(content)
-                    
-                    # Full document text voor embeddings
-                    full_text = f"{title} {clean_content} {category}"
-                    
-                    # Create embedding
-                    with st.spinner(f"Processing document {i+1}/{len(raw_data)}..."):
-                        embedding = self.embedder.encode(full_text)
-                    
-                    document_data = {
+                    documents.append({
                         "id": f"{file_hash}_{i}",
                         "title": title,
-                        "content": clean_content,
-                        "category": category,
-                        "audience": audience,
-                        "tags": tags,
-                        "full_text": full_text,
-                        "embedding": embedding,
+                        "content": content,
+                        "category": item.get('category', 'Algemeen'),
+                        "audience": item.get('audience', 'Algemeen'),
+                        "tags": item.get('tags', []),
+                        "embedding": self.embedder.encode(full_text),
                         "processed_at": datetime.now().isoformat()
-                    }
-                    
-                    documents.append(document_data)
-                    processed_count += 1
-                    
-                    # Update progress
-                    progress_bar.progress((i + 1) / len(raw_data))
-                    
+                    })
+                    progress_bar.progress((i + 1) / len(raw_data), f"Document {i+1}/{len(raw_data)} verwerkt...")
                 except Exception as e:
-                    st.warning(f"⚠️ Fout bij verwerken document {i+1}: {str(e)}")
-                    continue
-            
+                    st.warning(f"⚠️ Kon document {i+1} niet verwerken: {str(e)}")
+
             progress_bar.empty()
+
+            if not documents:
+                st.error("❌ Geen documenten konden worden verwerkt uit het bestand.")
+                return
+
+            # Sla alles op in session_state
+            st.session_state['documents_data'] = documents
+            st.session_state['document_embeddings_matrix'] = np.vstack([doc['embedding'] for doc in documents])
+            st.session_state['last_processed_file'] = f"{uploaded_file.name}_{uploaded_file.size}"
             
-            if processed_count == 0:
-                return [], "❌ Geen documenten konden worden verwerkt"
-            
-            success_msg = f"✅ {processed_count} documenten succesvol verwerkt (ID: {file_hash})"
-            return documents, success_msg
-            
+            st.success(f"✅ {len(documents)} documenten succesvol verwerkt (ID: {file_hash})")
+            st.rerun()
+
         except json.JSONDecodeError:
-            return [], "❌ Ongeldig JSON bestand"
+            st.error("❌ Ongeldig JSON-bestand. Controleer de structuur.")
         except Exception as e:
-            return [], f"❌ Fout bij verwerken: {str(e)}"
-    
+            st.error(f"❌ Onverwachte fout bij verwerken: {str(e)}")
+
     def find_similar_documents(self, query: str, top_k: int = 3) -> List[Dict]:
-        """Vind vergelijkbare documenten zonder ChromaDB"""
-        if not self.documents_data:
+        """Vind vergelijkbare documenten met een snelle, gevectoriseerde NumPy-operatie."""
+        if 'document_embeddings_matrix' not in st.session_state:
             return []
-        
+
         try:
-            # Create query embedding
-            query_embedding = self.embedder.encode(query)
+            query_embedding = self.embedder.encode(query).reshape(1, -1)
             
-            # Calculate similarities
-            similarities = []
-            for doc in self.documents_data:
-                similarity = cosine_similarity(
-                    query_embedding.reshape(1, -1),
-                    doc["embedding"].reshape(1, -1)
-                )[0][0]
-                
-                similarities.append({
-                    **doc,
-                    "similarity": float(similarity)
-                })
+            # Bereken similariteit met de hele matrix in één keer
+            all_similarities = cosine_similarity(query_embedding, st.session_state['document_embeddings_matrix'])[0]
             
-            # Sort by similarity
-            similarities.sort(key=lambda x: x["similarity"], reverse=True)
+            # Krijg de indices van de top_k hoogste scores
+            # Gebruik argpartition voor betere performance dan argsort op grote datasets
+            if len(all_similarities) > top_k:
+                top_k_indices = np.argpartition(all_similarities, -top_k)[-top_k:]
+                sorted_indices = top_k_indices[np.argsort(all_similarities[top_k_indices])][::-1]
+            else:
+                sorted_indices = np.argsort(all_similarities)[::-1]
+
+            # Maak de resultatenlijst
+            similar_docs = []
+            for index in sorted_indices:
+                doc = self.documents_data[index]
+                similar_docs.append({**doc, "similarity": float(all_similarities[index])})
             
-            return similarities[:top_k]
+            return similar_docs
             
         except Exception as e:
-            st.error(f"Error finding similar documents: {str(e)}")
+            st.error(f"❌ Fout bij zoeken naar documenten: {str(e)}")
             return []
-    
+
     def generate_response(self, query: str, context_docs: List[Dict]) -> str:
-        """Genereer response met Groq LLM"""
-        
+        """Genereer een antwoord met de LLM op basis van de gevonden context."""
         if not context_docs:
-            return "❌ Geen relevante informatie gevonden in de kennisbank."
-        
-        # Build context
+            return "Ik heb hier nog geen informatie over in mijn kennisbank."
+
         context_parts = []
         for doc in context_docs:
-            context_parts.append(f"""
-TITEL: {doc['title']}
-CATEGORIE: {doc['category']}
-INHOUD: {doc['content'][:1000]}...
-RELEVANTIE: {doc['similarity']:.1%}
----""")
+            if doc['similarity'] > self.SIMILARITY_THRESHOLD:
+                context_parts.append(f"--- BRON ---\nTITEL: {doc['title']}\nINHOUD: {doc['content'][:1500]}...\n")
         
-        context = "\n".join(context_parts)
-        
-        # Privacy-aware prompt
-        prompt = f"""
-JE BENT EEN NEDERLANDSE KLANTENSERVICE ASSISTENT.
+        if not context_parts:
+             return "Er is wat informatie, maar die sluit nog niet goed aan. Stel je je vraag even op een andere manier? Vind ik fijn."
 
-BELANGRIJKE REGELS:
-- Antwoord ALTIJD in het Nederlands
-- Gebruik ALLEEN informatie uit de onderstaande context
-- Als je geen relevant antwoord kunt vinden, zeg dat eerlijk
-- Verzin NOOIT informatie die niet in de context staat
-- Wees vriendelijk en professioneel
-- Geef concrete, bruikbare informatie
-- Refereer naar de titel van relevante documenten
+        context = "\n".join(context_parts)
+        prompt = f"""
+ROL:
+Je bent een deskundige, vriendelijke en professionele Nederlandstalige klantenservice-assistent.
+
+BRONGEBRUIK:
+- Baseer je antwoorden **uitsluitend** op de informatie in de onderstaande context.
+- **Verzin nooit** informatie die niet in de context staat.
+- Gebruik de context om een antwoord te geven dat direct aansluit bij de vraag van de gebruiker.
+- Staat het antwoord niet in de context? Laat dit dan duidelijk weten.
+
+REFERENTIE:
+- Verwijs waar mogelijk naar de titel van het bronbestand. Bijvoorbeeld: "Volgens het document 'Installatiegids' kan je...".
+
+ANTWOORDSTIJL:
+- Geef een duidelijk, beknopt en direct antwoord op de vraag.
+- Gebruik een professionele, maar toegankelijke toon.
 
 CONTEXT:
 {context}
-
-VRAAG: {query}
+VRAAG:
+{query}
+ANTWOORD:
 
 ANTWOORD:
 """
-        
         try:
-            # Call Groq API
             response = self.llm.complete(prompt)
             return str(response)
-            
         except Exception as e:
-            return f"❌ Fout bij genereren antwoord: {str(e)}"
-    
+            return f"❌ Fout bij het genereren van het antwoord: {str(e)}"
+
+    def display_sidebar(self):
+        """Toon de sidebar voor bestandsbeheer en informatie."""
+        with st.sidebar:
+            st.header("📁 Kennisbank Management")
+
+            uploaded_file = st.file_uploader(
+                "Upload Kennisbank (JSON)", type="json",
+                help="Upload een JSON-bestand met een lijst van documenten. Elk document moet 'title' en 'content' bevatten."
+            )
+
+            if uploaded_file:
+                file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+                if st.session_state.get('last_processed_file') != file_id:
+                    self.process_uploaded_documents(uploaded_file)
+                else:
+                    st.info("✅ Dit bestand is al geladen.")
+
+            if self.documents_data:
+                st.subheader("📊 Kennisbank Status")
+                st.metric("Aantal Documenten", f"{len(self.documents_data)}")
+                
+                if st.button("🧹 Kennisbank Wissen"):
+                    keys_to_delete = ['documents_data', 'document_embeddings_matrix', 'last_processed_file', 'messages']
+                    for key in keys_to_delete:
+                        if key in st.session_state:
+                            del st.session_state[key]
+                    st.rerun()
+
+            st.subheader("🔒 Privacy & Techniek")
+            st.info(
+                "**Privacy-First:** Uw data wordt lokaal in uw browser-sessie verwerkt en niet opgeslagen op een server. "
+                "Embeddings worden lokaal gegenereerd."
+            )
+            st.markdown(
+                f"""
+                - **LLM:** Groq `{self.LLM_MODEL}`
+                - **Embeddings:** `{self.EMBEDDING_MODEL}`
+                - **Vector Store:** In-Memory (NumPy)
+                """
+            )
+
     def display_chat_interface(self):
-        """Hoofdchat interface"""
-        
-        # Initialize chat history
+        """Toon de hoofd-chatinterface."""
+        st.title("🔒 Private Kennisbank Chatbot")
+        st.markdown("*Een veilige RAG-chatbot, compatibel met Streamlit Cloud, zonder externe database.*")
+
         if "messages" not in st.session_state:
-            st.session_state.messages = [
-                {
-                    "role": "assistant", 
-                    "content": "👋 Hallo! Ik ben je private kennisbank assistent. Upload eerst je kennisbank via de sidebar, dan kan ik je vragen beantwoorden."
-                }
-            ]
-        
-        # Display chat messages
+            st.session_state.messages = [{"role": "assistant", "content": "👋 Hallo! Upload een kennisbank via de sidebar om te beginnen."}]
+
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
-        
-        # Chat input
-        if prompt := st.chat_input("Stel je vraag over de kennisbank..."):
-            # Add user message
+
+        if prompt := st.chat_input("Stel uw vraag..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
-            
             with st.chat_message("user"):
                 st.markdown(prompt)
-            
-            # Generate response
-            if self.documents_data:
-                with st.chat_message("assistant"):
-                    with st.spinner("🤔 Zoeken in kennisbank..."):
-                        # Find similar documents
-                        similar_docs = self.find_similar_documents(prompt)
-                        
-                        # Generate response
-                        response = self.generate_response(prompt, similar_docs)
-                        
-                        st.markdown(response)
-                        st.session_state.messages.append({"role": "assistant", "content": response})
-                        
-                        # Show sources if available
-                        if similar_docs and similar_docs[0]["similarity"] > 0.3:
-                            with st.expander("📚 Gebruikte bronnen"):
-                                for doc in similar_docs[:2]:
-                                    st.write(f"• **{doc['title']}** ({doc['similarity']:.1%} relevant)")
-            else:
-                with st.chat_message("assistant"):
-                    warning_msg = "⚠️ Er is nog geen kennisbank geladen. Upload eerst je JSON bestand via de sidebar."
+
+            with st.chat_message("assistant"):
+                if not self.documents_data:
+                    warning_msg = "⚠️ Geen kennisbank geladen. Upload eerst een bestand."
                     st.warning(warning_msg)
                     st.session_state.messages.append({"role": "assistant", "content": warning_msg})
-    
-    def display_sidebar(self):
-        """Sidebar met upload en informatie"""
-        with st.sidebar:
-            st.header("📁 Kennisbank Management")
-            
-            # Load from session if available (EERST controleren!)
-            if 'documents_data' in st.session_state and not self.documents_data:
-                self.documents_data = st.session_state['documents_data']
-                st.info(f"✅ Kennisbank herlaadt: {len(self.documents_data)} documenten")
-            
-            # File upload
-            uploaded_file = st.file_uploader(
-                "Upload Kennisbank (JSON)",
-                type="json",
-                help="Upload je private kennisbank JSON bestand",
-                key="json_uploader"
-            )
-            
-            if uploaded_file:
-                # Voorkom herverwerking van hetzelfde bestand
-                file_id = f"{uploaded_file.name}_{uploaded_file.size}"
-                
-                if st.session_state.get('last_processed_file') != file_id:
-                    # Process documents
-                    with st.spinner("📄 Verwerken van documenten..."):
-                        documents, result_msg = self.process_uploaded_documents(uploaded_file)
+                    return
+
+                with st.spinner("🧠 Denken..."):
+                    similar_docs = self.find_similar_documents(prompt)
+                    response = self.generate_response(prompt, similar_docs)
+                    st.markdown(response)
                     
-                    if documents:
-                        st.success(result_msg)
-                        
-                        # Store in BOTH class and session
-                        self.documents_data = documents
-                        st.session_state['documents_data'] = documents
-                        st.session_state['last_processed_file'] = file_id
-                        
-                        # Force rerun to update the interface
-                        st.rerun()
-                    else:
-                        st.error(result_msg)
-                else:
-                    st.info("✅ Bestand al verwerkt")
-            
-            # Status check (DEBUG info)
-            st.subheader("🔍 Debug Status")
-            st.write(f"Documents in class: {len(self.documents_data)}")
-            st.write(f"Documents in session: {len(st.session_state.get('documents_data', []))}")
-            
-            # Show current stats if data exists
-            if self.documents_data:
-                st.subheader("📊 Statistieken")
-                categories = {}
-                for doc in self.documents_data:
-                    cat = doc.get('category', 'Onbekend')
-                    categories[cat] = categories.get(cat, 0) + 1
+                    # Toon bronnen in een expander
+                    valid_sources = [doc for doc in similar_docs if doc['similarity'] > self.SIMILARITY_THRESHOLD]
+                    if valid_sources:
+                        with st.expander("📚 Gebruikte bronnen"):
+                            for doc in valid_sources:
+                                st.write(f"• **{doc['title']}** (Relevantie: {doc['similarity']:.1%})")
                 
-                for cat, count in categories.items():
-                    st.text(f"• {cat}: {count} documenten")
-                
-                # Show quality metrics
-                avg_content_length = np.mean([len(doc['content']) for doc in self.documents_data])
-                st.metric("Gem. artikel lengte", f"{avg_content_length:.0f} chars")
-            
-            # Load from session button (manual backup)
-            if st.button("🔄 Herlaad uit Session"):
-                if 'documents_data' in st.session_state:
-                    self.documents_data = st.session_state['documents_data']
-                    st.success(f"✅ {len(self.documents_data)} documenten herladen")
-                    st.rerun()
-                else:
-                    st.error("❌ Geen data in session gevonden")
-            
-            # Privacy info
-            st.subheader("🔒 Privacy Info")
-            st.info("""
-            **Streamlit Cloud Compatible:**
-            - ✅ Geen ChromaDB (SQLite issue opgelost)
-            - ✅ Session-based opslag
-            - ✅ Gevoelige data filtering  
-            - ✅ Lokale embeddings
-            - ✅ Privacy-first design
-            """)
-            
-            # System info
-            st.subheader("⚙️ Technische Info")
-            st.text("🤖 LLM: Groq Llama3-70B")
-            st.text("🔍 Embeddings: SentenceTransformers")
-            st.text("🗄️ Vector Store: In-Memory")
-            st.text("☁️ Platform: Streamlit Cloud")
-            
-            # Clear data button
-            if st.button("🧹 Clear Kennisbank"):
-                self.documents_data = []
-                if 'documents_data' in st.session_state:
-                    del st.session_state['documents_data']
-                if 'last_processed_file' in st.session_state:
-                    del st.session_state['last_processed_file']
-                if 'messages' in st.session_state:
-                    st.session_state.messages = [
-                        {"role": "assistant", "content": "Kennisbank is gewist. Upload een nieuw bestand om te beginnen."}
-                    ]
-                st.rerun()
-    
-    def display_header(self):
-        """App header met informatie"""
-        st.title("🔒 Private Kennisbank Chatbot")
-        st.markdown("*Streamlit Cloud Compatible • ChromaDB-vrij • Privacy-first*")
-        
-        # Status indicators
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            if self.documents_data:
-                st.success("🟢 Kennisbank Actief")
-            else:
-                st.warning("🟡 Geen Kennisbank")
-        
-        with col2:
-            st.info("🔒 Privacy Mode")
-        
-        with col3:
-            st.success("☁️ Cloud Compatible")
-        
-        with col4:
-            if st.secrets.get("access_password", ""):
-                if st.session_state.get('authenticated', False):
-                    st.success("🔓 Toegang OK")
-                else:
-                    st.error("🔐 Geen Toegang")
-            else:
-                st.success("🔓 Open Access")
-    
+                st.session_state.messages.append({"role": "assistant", "content": response})
+
     def run(self):
-        """Hoofdfunctie om de app te starten"""
-        
-        # Access control
-        if not self.check_access_control():
-            return
-        
-        # Load documents from session on startup (BELANGRIJK!)
-        if 'documents_data' in st.session_state and not self.documents_data:
-            self.documents_data = st.session_state['documents_data']
-        
-        # Display app
-        self.display_header()
-        
-        # Layout
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            self.display_chat_interface()
-        
-        with col2:
+        """Start de applicatie."""
+        if self.check_access_control():
             self.display_sidebar()
-        
-        # Footer
-        st.markdown("---")
-        st.caption("🔒 Private RAG Chatbot | ChromaDB-vrij voor Streamlit Cloud | Privacy-first design")
+            self.display_chat_interface()
 
-
-# Main execution
-def main():
-    """Main functie"""
-    try:
-        chatbot = StreamlitCompatibleRAG()
-        chatbot.run()
-        
-    except Exception as e:
-        st.error(f"❌ Kritieke fout: {str(e)}")
-        st.info("Neem contact op met de beheerder.")
-        st.exception(e)  # Voor debugging
-
-
+# --- Hoofduitvoering ---
 if __name__ == "__main__":
-    main()
+    try:
+        app = StreamlitCompatibleRAG()
+        app.run()
+    except Exception as e:
+        st.error(f"❌ Een onverwachte kritieke fout is opgetreden: {e}")
+        st.exception(e)
