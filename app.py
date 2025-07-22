@@ -27,10 +27,11 @@ class StreamlitCompatibleRAG:
     SIMILARITY_THRESHOLD = 0.3  # Drempelwaarde om bronnen te tonen
 
     def __init__(self):
-        """Initialiseer de applicatie en de benodigde componenten."""
+        """Initialiseer de applicatie."""
         self.setup_page_config()
-        self.llm, self.embedder = self.initialize_components()
-
+        # Componenten worden later geïnitialiseerd in de run-methode om caching-fouten te voorkomen
+        self.llm = None
+        self.embedder = None
         # Gebruik st.session_state als de 'single source of truth'
         self.documents_data = st.session_state.get('documents_data', [])
 
@@ -38,7 +39,7 @@ class StreamlitCompatibleRAG:
         """Configureer de Streamlit pagina."""
         st.set_page_config(
             page_title="🔒 Private Kennisbank Chat",
-            page_icon="🔒",
+            page_icon="�",
             layout="wide",
             initial_sidebar_state="expanded"
         )
@@ -47,28 +48,22 @@ class StreamlitCompatibleRAG:
     def initialize_components(_self):
         """
         Initialiseer en cache de zware componenten (LLM en embedder).
-        Gebruik @_self omdat @st.cache_resource geen 'self' accepteert.
+        Deze functie mag GEEN Streamlit UI-elementen aanroepen.
+        Geeft componenten terug of raise een exception bij een fout.
         """
-        try:
-            groq_api_key = st.secrets.get("GROQ_API_KEY")
-            if not groq_api_key:
-                st.error("❌ GROQ_API_KEY niet gevonden in Streamlit secrets!")
-                st.stop()
+        groq_api_key = st.secrets.get("GROQ_API_KEY")
+        if not groq_api_key:
+            raise ValueError("GROQ_API_KEY niet gevonden in Streamlit secrets! Configureer dit a.u.b.")
 
-            llm = Groq(
-                model=_self.LLM_MODEL,
-                api_key=groq_api_key,
-                temperature=0.1
-            )
-            
-            embedder = SentenceTransformer(_self.EMBEDDING_MODEL)
-            
-            st.toast("✅ Systeemcomponenten succesvol geladen!", icon="🚀")
-            return llm, embedder
-
-        except Exception as e:
-            st.error(f"❌ Kritieke fout bij initialisatie: {str(e)}")
-            st.stop()
+        llm = Groq(
+            model=_self.LLM_MODEL,
+            api_key=groq_api_key,
+            temperature=0.1
+        )
+        
+        embedder = SentenceTransformer(_self.EMBEDDING_MODEL)
+        
+        return llm, embedder
 
     def check_access_control(self) -> bool:
         """Controleer de toegang tot de applicatie via een wachtwoord."""
@@ -168,18 +163,14 @@ class StreamlitCompatibleRAG:
         try:
             query_embedding = self.embedder.encode(query).reshape(1, -1)
             
-            # Bereken similariteit met de hele matrix in één keer
             all_similarities = cosine_similarity(query_embedding, st.session_state['document_embeddings_matrix'])[0]
             
-            # Krijg de indices van de top_k hoogste scores
-            # Gebruik argpartition voor betere performance dan argsort op grote datasets
             if len(all_similarities) > top_k:
                 top_k_indices = np.argpartition(all_similarities, -top_k)[-top_k:]
                 sorted_indices = top_k_indices[np.argsort(all_similarities[top_k_indices])][::-1]
             else:
                 sorted_indices = np.argsort(all_similarities)[::-1]
 
-            # Maak de resultatenlijst
             similar_docs = []
             for index in sorted_indices:
                 doc = self.documents_data[index]
@@ -194,7 +185,7 @@ class StreamlitCompatibleRAG:
     def generate_response(self, query: str, context_docs: List[Dict]) -> str:
         """Genereer een antwoord met de LLM op basis van de gevonden context."""
         if not context_docs:
-            return "Ik heb hier nog geen informatie over in mijn kennisbank."
+            return "Ik kon geen relevante informatie vinden in de huidige kennisbank om uw vraag te beantwoorden."
 
         context_parts = []
         for doc in context_docs:
@@ -202,7 +193,7 @@ class StreamlitCompatibleRAG:
                 context_parts.append(f"--- BRON ---\nTITEL: {doc['title']}\nINHOUD: {doc['content'][:1500]}...\n")
         
         if not context_parts:
-             return "Er is wat informatie, maar die sluit nog niet goed aan. Stel je je vraag even op een andere manier? Vind ik fijn."
+             return "Hoewel er documenten zijn gevonden, was de relevantie te laag. Ik kan geen betrouwbaar antwoord geven. Probeer uw vraag anders te formuleren."
 
         context = "\n".join(context_parts)
         prompt = f"""
@@ -306,7 +297,6 @@ ANTWOORD:
                     response = self.generate_response(prompt, similar_docs)
                     st.markdown(response)
                     
-                    # Toon bronnen in een expander
                     valid_sources = [doc for doc in similar_docs if doc['similarity'] > self.SIMILARITY_THRESHOLD]
                     if valid_sources:
                         with st.expander("📚 Gebruikte bronnen"):
@@ -316,7 +306,18 @@ ANTWOORD:
                 st.session_state.messages.append({"role": "assistant", "content": response})
 
     def run(self):
-        """Start de applicatie."""
+        """Start de applicatie en orkestreer de UI."""
+        try:
+            if self.llm is None or self.embedder is None:
+                self.llm, self.embedder = self.initialize_components()
+                if 'components_loaded_toast' not in st.session_state:
+                    st.toast("✅ Systeemcomponenten succesvol geladen!", icon="🚀")
+                    st.session_state['components_loaded_toast'] = True
+        except Exception as e:
+            st.error(f"❌ Kritieke fout bij het laden van de componenten: {e}")
+            st.info("Controleer de secrets van je Streamlit-applicatie en herlaad de pagina.")
+            return
+
         if self.check_access_control():
             self.display_sidebar()
             self.display_chat_interface()
