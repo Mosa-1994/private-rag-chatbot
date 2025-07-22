@@ -10,7 +10,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 # LlamaIndex imports - alleen wat je gebruikt
 from llama_index.core import VectorStoreIndex, Document, Settings
 from llama_index.llms.groq import Groq
-# REMOVED: from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from sentence_transformers import SentenceTransformer
 
 
@@ -314,7 +313,7 @@ ANTWOORD:
                 "Upload Kennisbank (JSON)",
                 type="json",
                 help="Upload je private kennisbank JSON bestand",
-                key="json_uploader"  # Unieke key toegevoegd
+                key="json_uploader"
             )
             
             if uploaded_file:
@@ -336,25 +335,6 @@ ANTWOORD:
                         
                         # Force rerun to update the interface
                         st.rerun()
-                    else:
-                        st.error(result_msg)
-                else:
-                    st.info("✅ Bestand al verwerkt")
-                    
-                    # Show stats
-                    st.subheader("📊 Statistieken")
-                    categories = {}
-                    for doc in documents:
-                        cat = doc.get('category', 'Onbekend')
-                        categories[cat] = categories.get(cat, 0) + 1
-                    
-                    for cat, count in categories.items():
-                        st.text(f"• {cat}: {count} documenten")
-                    
-                    # Show quality metrics
-                    avg_content_length = np.mean([len(doc['content']) for doc in documents])
-                    st.metric("Gem. artikel lengte", f"{avg_content_length:.0f} chars")
-                    
                     else:
                         st.error(result_msg)
                 else:
@@ -388,6 +368,37 @@ ANTWOORD:
                     st.rerun()
                 else:
                     st.error("❌ Geen data in session gevonden")
+            
+            # Privacy info
+            st.subheader("🔒 Privacy Info")
+            st.info("""
+            **Streamlit Cloud Compatible:**
+            - ✅ Geen ChromaDB (SQLite issue opgelost)
+            - ✅ Session-based opslag
+            - ✅ Gevoelige data filtering  
+            - ✅ Lokale embeddings
+            - ✅ Privacy-first design
+            """)
+            
+            # System info
+            st.subheader("⚙️ Technische Info")
+            st.text("🤖 LLM: Groq Llama3-70B")
+            st.text("🔍 Embeddings: SentenceTransformers")
+            st.text("🗄️ Vector Store: In-Memory")
+            st.text("☁️ Platform: Streamlit Cloud")
+            
+            # Clear data button
+            if st.button("🧹 Clear Kennisbank"):
+                self.documents_data = []
+                if 'documents_data' in st.session_state:
+                    del st.session_state['documents_data']
+                if 'last_processed_file' in st.session_state:
+                    del st.session_state['last_processed_file']
+                if 'messages' in st.session_state:
+                    st.session_state.messages = [
+                        {"role": "assistant", "content": "Kennisbank is gewist. Upload een nieuw bestand om te beginnen."}
+                    ]
+                st.rerun()
     
     def display_header(self):
         """App header met informatie"""
