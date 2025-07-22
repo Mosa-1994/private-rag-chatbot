@@ -4,22 +4,24 @@ import hashlib
 import re
 from datetime import datetime
 from typing import List, Dict, Optional
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
-# LlamaIndex imports
+# LlamaIndex imports - zonder ChromaDB
 from llama_index.core import VectorStoreIndex, Document, Settings
 from llama_index.llms.groq import Groq
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.core import StorageContext
-import chromadb
+from sentence_transformers import SentenceTransformer
 
 
-class PrivateRAGChatbot:
-    """Privacy-beschermde RAG Chatbot voor bedrijfskennisbank"""
+class StreamlitCompatibleRAG:
+    """RAG Chatbot compatible met Streamlit Cloud (geen ChromaDB)"""
     
     def __init__(self):
         self.setup_page_config()
         self.initialize_components()
+        self.documents_data = []  # Store voor document data
+        self.embeddings_cache = {}  # Cache voor embeddings
     
     def setup_page_config(self):
         """Streamlit pagina configuratie"""
@@ -42,23 +44,15 @@ class PrivateRAGChatbot:
             self.llm = Groq(
                 model="llama3-70b-8192",
                 api_key=groq_api_key,
-                temperature=0.1  # Consistente antwoorden
+                temperature=0.1
             )
             
-            # Nederlandse embeddings
-            self.embed_model = HuggingFaceEmbedding(
-                model_name="sentence-transformers/distiluse-base-multilingual-cased"
+            # Lokale sentence transformer voor embeddings
+            self.embedder = SentenceTransformer(
+                'sentence-transformers/distiluse-base-multilingual-cased'
             )
             
-            # Global settings
-            Settings.llm = self.llm
-            Settings.embed_model = self.embed_model
-            
-            # Privacy & security settings
-            self.access_password = st.secrets.get("access_password", "")
-            self.authorized_emails = st.secrets.get("authorized_emails", [])
-            
-            st.success("✅ Systeem succesvol geïnitialiseerd!")
+            st.success("✅ Systeem succesvol geïnitialiseerd (ChromaDB-vrij)!")
             
         except Exception as e:
             st.error(f"❌ Fout bij initialisatie: {str(e)}")
@@ -66,7 +60,9 @@ class PrivateRAGChatbot:
     
     def check_access_control(self) -> bool:
         """Controleer toegang tot de applicatie"""
-        if not self.access_password:
+        access_password = st.secrets.get("access_password", "")
+        
+        if not access_password:
             return True  # Geen toegangscontrole
         
         if 'authenticated' not in st.session_state:
@@ -77,7 +73,7 @@ class PrivateRAGChatbot:
                 submit = st.form_submit_button("Inloggen")
                 
                 if submit:
-                    if password == self.access_password:
+                    if password == access_password:
                         st.session_state['authenticated'] = True
                         st.success("✅ Toegang verleend!")
                         st.rerun()
@@ -108,13 +104,10 @@ class PrivateRAGChatbot:
         
         return content
     
-    def process_uploaded_documents(self, uploaded_file) -> tuple[List[Document], str]:
-        """Verwerk uploaded JSON bestand veilig"""
+    def process_uploaded_documents(self, uploaded_file) -> tuple[List[Dict], str]:
+        """Verwerk uploaded JSON bestand"""
         try:
-            # Hash voor privacy
             file_hash = hashlib.md5(uploaded_file.name.encode()).hexdigest()[:8]
-            
-            # Parse JSON
             raw_data = json.loads(uploaded_file.getvalue())
             
             if not isinstance(raw_data, list):
@@ -123,9 +116,11 @@ class PrivateRAGChatbot:
             documents = []
             processed_count = 0
             
+            # Progress bar
+            progress_bar = st.progress(0)
+            
             for i, item in enumerate(raw_data):
                 try:
-                    # Verwachte velden
                     title = item.get('title', f'Document {i+1}')
                     content = item.get('content', '')
                     category = item.get('category', 'Algemeen')
@@ -135,34 +130,36 @@ class PrivateRAGChatbot:
                     # Sanitize content
                     clean_content = self.sanitize_content(content)
                     
-                    # Enhanced document text
-                    doc_text = f"""
-TITEL: {title}
-
-INHOUD:
-{clean_content}
-
-CATEGORIE: {category}
-DOELGROEP: {audience}
-TAGS: {', '.join(tags) if tags else 'Geen tags'}
-"""
+                    # Full document text voor embeddings
+                    full_text = f"{title} {clean_content} {category}"
                     
-                    # Metadata
-                    metadata = {
-                        "doc_id": f"{file_hash}_{i}",
+                    # Create embedding
+                    with st.spinner(f"Processing document {i+1}/{len(raw_data)}..."):
+                        embedding = self.embedder.encode(full_text)
+                    
+                    document_data = {
+                        "id": f"{file_hash}_{i}",
                         "title": title,
+                        "content": clean_content,
                         "category": category,
                         "audience": audience,
                         "tags": tags,
+                        "full_text": full_text,
+                        "embedding": embedding,
                         "processed_at": datetime.now().isoformat()
                     }
                     
-                    documents.append(Document(text=doc_text.strip(), metadata=metadata))
+                    documents.append(document_data)
                     processed_count += 1
+                    
+                    # Update progress
+                    progress_bar.progress((i + 1) / len(raw_data))
                     
                 except Exception as e:
                     st.warning(f"⚠️ Fout bij verwerken document {i+1}: {str(e)}")
                     continue
+            
+            progress_bar.empty()
             
             if processed_count == 0:
                 return [], "❌ Geen documenten konden worden verwerkt"
@@ -175,58 +172,83 @@ TAGS: {', '.join(tags) if tags else 'Geen tags'}
         except Exception as e:
             return [], f"❌ Fout bij verwerken: {str(e)}"
     
-    def create_vector_index(self, documents: List[Document]) -> Optional[VectorStoreIndex]:
-        """Maak vector index van documenten"""
+    def find_similar_documents(self, query: str, top_k: int = 3) -> List[Dict]:
+        """Vind vergelijkbare documenten zonder ChromaDB"""
+        if not self.documents_data:
+            return []
+        
         try:
-            with st.spinner("🔄 Vector index bouwen..."):
-                # In-memory ChromaDB (privacy-vriendelijk)
-                chroma_client = chromadb.EphemeralClient()
-                collection = chroma_client.get_or_create_collection(
-                    name="private_knowledge_base"
-                )
+            # Create query embedding
+            query_embedding = self.embedder.encode(query)
+            
+            # Calculate similarities
+            similarities = []
+            for doc in self.documents_data:
+                similarity = cosine_similarity(
+                    query_embedding.reshape(1, -1),
+                    doc["embedding"].reshape(1, -1)
+                )[0][0]
                 
-                vector_store = ChromaVectorStore(chroma_collection=collection)
-                storage_context = StorageContext.from_defaults(vector_store=vector_store)
-                
-                # Build index
-                index = VectorStoreIndex.from_documents(
-                    documents,
-                    storage_context=storage_context,
-                    show_progress=True
-                )
-                
-                return index
-                
+                similarities.append({
+                    **doc,
+                    "similarity": float(similarity)
+                })
+            
+            # Sort by similarity
+            similarities.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            return similarities[:top_k]
+            
         except Exception as e:
-            st.error(f"❌ Fout bij maken vector index: {str(e)}")
-            return None
+            st.error(f"Error finding similar documents: {str(e)}")
+            return []
     
-    def create_query_engine(self, index: VectorStoreIndex):
-        """Maak query engine met privacy controls"""
+    def generate_response(self, query: str, context_docs: List[Dict]) -> str:
+        """Genereer response met Groq LLM"""
         
-        privacy_system_prompt = """
-        JE BENT EEN NEDERLANDSE KLANTENSERVICE ASSISTENT.
+        if not context_docs:
+            return "❌ Geen relevante informatie gevonden in de kennisbank."
         
-        BELANGRIJKE REGELS:
-        - Antwoord ALTIJD in het Nederlands
-        - Gebruik ALLEEN informatie uit de gegeven context
-        - Als je geen relevant antwoord kunt vinden, zeg dat eerlijk
-        - Verzin NOOIT informatie die niet in de context staat
-        - Wees vriendelijk en professioneel
-        - Geef concrete, bruikbare informatie
+        # Build context
+        context_parts = []
+        for doc in context_docs:
+            context_parts.append(f"""
+TITEL: {doc['title']}
+CATEGORIE: {doc['category']}
+INHOUD: {doc['content'][:1000]}...
+RELEVANTIE: {doc['similarity']:.1%}
+---""")
         
-        PRIVACY REGELS:
-        - Deel geen gevoelige bedrijfsinformatie
-        - Refereer niet naar specifieke systemen of processen tenzij relevant
-        - Houd antwoorden algemeen maar nuttig
-        """
+        context = "\n".join(context_parts)
         
-        return index.as_query_engine(
-            similarity_top_k=3,
-            streaming=False,
-            system_prompt=privacy_system_prompt,
-            response_mode="compact"
-        )
+        # Privacy-aware prompt
+        prompt = f"""
+JE BENT EEN NEDERLANDSE KLANTENSERVICE ASSISTENT.
+
+BELANGRIJKE REGELS:
+- Antwoord ALTIJD in het Nederlands
+- Gebruik ALLEEN informatie uit de onderstaande context
+- Als je geen relevant antwoord kunt vinden, zeg dat eerlijk
+- Verzin NOOIT informatie die niet in de context staat
+- Wees vriendelijk en professioneel
+- Geef concrete, bruikbare informatie
+- Refereer naar de titel van relevante documenten
+
+CONTEXT:
+{context}
+
+VRAAG: {query}
+
+ANTWOORD:
+"""
+        
+        try:
+            # Call Groq API
+            response = self.llm.complete(prompt)
+            return str(response)
+            
+        except Exception as e:
+            return f"❌ Fout bij genereren antwoord: {str(e)}"
     
     def display_chat_interface(self):
         """Hoofdchat interface"""
@@ -254,20 +276,23 @@ TAGS: {', '.join(tags) if tags else 'Geen tags'}
                 st.markdown(prompt)
             
             # Generate response
-            if 'query_engine' in st.session_state:
+            if self.documents_data:
                 with st.chat_message("assistant"):
                     with st.spinner("🤔 Zoeken in kennisbank..."):
-                        try:
-                            response = st.session_state.query_engine.query(prompt)
-                            answer = str(response)
-                            
-                            st.markdown(answer)
-                            st.session_state.messages.append({"role": "assistant", "content": answer})
-                            
-                        except Exception as e:
-                            error_msg = f"❌ Er ging iets mis: {str(e)}"
-                            st.error(error_msg)
-                            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                        # Find similar documents
+                        similar_docs = self.find_similar_documents(prompt)
+                        
+                        # Generate response
+                        response = self.generate_response(prompt, similar_docs)
+                        
+                        st.markdown(response)
+                        st.session_state.messages.append({"role": "assistant", "content": response})
+                        
+                        # Show sources if available
+                        if similar_docs and similar_docs[0]["similarity"] > 0.3:
+                            with st.expander("📚 Gebruikte bronnen"):
+                                for doc in similar_docs[:2]:
+                                    st.write(f"• **{doc['title']}** ({doc['similarity']:.1%} relevant)")
             else:
                 with st.chat_message("assistant"):
                     warning_msg = "⚠️ Er is nog geen kennisbank geladen. Upload eerst je JSON bestand via de sidebar."
@@ -287,57 +312,62 @@ TAGS: {', '.join(tags) if tags else 'Geen tags'}
             )
             
             if uploaded_file:
-                with st.spinner("🔐 Veilig verwerken..."):
-                    documents, result_msg = self.process_uploaded_documents(uploaded_file)
+                # Process documents
+                documents, result_msg = self.process_uploaded_documents(uploaded_file)
+                
+                if documents:
+                    st.success(result_msg)
                     
-                    if documents:
-                        st.success(result_msg)
-                        
-                        # Create vector index
-                        index = self.create_vector_index(documents)
-                        
-                        if index:
-                            # Create query engine
-                            query_engine = self.create_query_engine(index)
-                            
-                            # Store in session
-                            st.session_state['index'] = index
-                            st.session_state['query_engine'] = query_engine
-                            st.session_state['documents'] = documents
-                            
-                            st.success("🎯 Kennisbank succesvol geladen!")
-                            
-                            # Show stats
-                            st.subheader("📊 Statistieken")
-                            categories = {}
-                            for doc in documents:
-                                cat = doc.metadata.get('category', 'Onbekend')
-                                categories[cat] = categories.get(cat, 0) + 1
-                            
-                            for cat, count in categories.items():
-                                st.text(f"• {cat}: {count} documenten")
-                        
-                        else:
-                            st.error("❌ Fout bij maken vector index")
-                    else:
-                        st.error(result_msg)
+                    # Store in class
+                    self.documents_data = documents
+                    
+                    # Store in session for persistence
+                    st.session_state['documents_data'] = documents
+                    
+                    # Show stats
+                    st.subheader("📊 Statistieken")
+                    categories = {}
+                    for doc in documents:
+                        cat = doc.get('category', 'Onbekend')
+                        categories[cat] = categories.get(cat, 0) + 1
+                    
+                    for cat, count in categories.items():
+                        st.text(f"• {cat}: {count} documenten")
+                    
+                    # Show quality metrics
+                    avg_content_length = np.mean([len(doc['content']) for doc in documents])
+                    st.metric("Gem. artikel lengte", f"{avg_content_length:.0f} chars")
+                    
+                else:
+                    st.error(result_msg)
+            
+            # Load from session if available
+            if 'documents_data' in st.session_state and not self.documents_data:
+                self.documents_data = st.session_state['documents_data']
             
             # Privacy info
             st.subheader("🔒 Privacy Info")
             st.info("""
-            **Privacy Maatregelen:**
+            **Streamlit Cloud Compatible:**
+            - ✅ Geen ChromaDB (SQLite issue opgelost)
             - ✅ Session-based opslag
             - ✅ Gevoelige data filtering  
-            - ✅ Toegangscontrole
-            - ✅ Geen permanente opslag
-            - ✅ Lokale embedding processing
+            - ✅ Lokale embeddings
+            - ✅ Privacy-first design
             """)
+            
+            # System info
+            st.subheader("⚙️ Technische Info")
+            st.text("🤖 LLM: Groq Llama3-70B")
+            st.text("🔍 Embeddings: SentenceTransformers")
+            st.text("🗄️ Vector Store: In-Memory")
+            st.text("☁️ Platform: Streamlit Cloud")
             
             # Clear data button
             if st.button("🧹 Clear Kennisbank"):
-                for key in ['index', 'query_engine', 'documents']:
-                    if key in st.session_state:
-                        del st.session_state[key]
+                self.documents_data = []
+                if 'documents_data' in st.session_state:
+                    del st.session_state['documents_data']
                 if 'messages' in st.session_state:
                     st.session_state.messages = [
                         {"role": "assistant", "content": "Kennisbank is gewist. Upload een nieuw bestand om te beginnen."}
@@ -347,13 +377,13 @@ TAGS: {', '.join(tags) if tags else 'Geen tags'}
     def display_header(self):
         """App header met informatie"""
         st.title("🔒 Private Kennisbank Chatbot")
-        st.markdown("*Semi-private • Toegangscontrole • Bedrijfsdata*")
+        st.markdown("*Streamlit Cloud Compatible • ChromaDB-vrij • Privacy-first*")
         
         # Status indicators
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            if 'query_engine' in st.session_state:
+            if self.documents_data:
                 st.success("🟢 Kennisbank Actief")
             else:
                 st.warning("🟡 Geen Kennisbank")
@@ -362,13 +392,16 @@ TAGS: {', '.join(tags) if tags else 'Geen tags'}
             st.info("🔒 Privacy Mode")
         
         with col3:
-            st.info("🌐 Online Hosting")
+            st.success("☁️ Cloud Compatible")
         
         with col4:
-            if st.session_state.get('authenticated', True):
-                st.success("🔓 Toegang OK")
+            if st.secrets.get("access_password", ""):
+                if st.session_state.get('authenticated', False):
+                    st.success("🔓 Toegang OK")
+                else:
+                    st.error("🔐 Geen Toegang")
             else:
-                st.error("🔐 Geen Toegang")
+                st.success("🔓 Open Access")
     
     def run(self):
         """Hoofdfunctie om de app te starten"""
@@ -391,19 +424,20 @@ TAGS: {', '.join(tags) if tags else 'Geen tags'}
         
         # Footer
         st.markdown("---")
-        st.caption("🔒 Private RAG Chatbot | Gebouwd met Streamlit & LlamaIndex | Data blijft veilig")
+        st.caption("🔒 Private RAG Chatbot | ChromaDB-vrij voor Streamlit Cloud | Privacy-first design")
 
 
 # Main execution
 def main():
     """Main functie"""
     try:
-        chatbot = PrivateRAGChatbot()
+        chatbot = StreamlitCompatibleRAG()
         chatbot.run()
         
     except Exception as e:
         st.error(f"❌ Kritieke fout: {str(e)}")
         st.info("Neem contact op met de beheerder.")
+        st.exception(e)  # Voor debugging
 
 
 if __name__ == "__main__":
