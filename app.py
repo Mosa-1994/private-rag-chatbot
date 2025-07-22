@@ -7,10 +7,10 @@ from typing import List, Dict, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-# LlamaIndex imports - zonder ChromaDB
+# LlamaIndex imports - alleen wat je gebruikt
 from llama_index.core import VectorStoreIndex, Document, Settings
 from llama_index.llms.groq import Groq
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+# REMOVED: from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from sentence_transformers import SentenceTransformer
 
 
