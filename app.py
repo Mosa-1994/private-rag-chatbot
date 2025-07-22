@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+import uuid
 
 # LlamaIndex en SentenceTransformer imports
 from llama_index.llms.groq import Groq
@@ -14,11 +15,12 @@ from sentence_transformers import SentenceTransformer
 
 class StreamlitCompatibleRAG:
     """
-    RAG Chatbot geoptimaliseerd voor Streamlit Cloud.
+    RAG Chatbot geoptimaliseerd voor Streamlit Cloud met chat geschiedenis functionaliteit.
     - Gebruikt in-memory vector search met NumPy voor snelheid.
     - Geen schijfafhankelijkheden (zoals ChromaDB/SQLite).
     - State management via st.session_state voor een naadloze ervaring.
     - Focus op privacy met lokale embeddings en content filtering.
+    - Chat geschiedenis management met mogelijkheid voor nieuwe chats.
     """
 
     # --- Configuratie Constanten ---
@@ -34,12 +36,92 @@ class StreamlitCompatibleRAG:
         self.embedder = None
         # Gebruik st.session_state als de 'single source of truth'
         self.documents_data = st.session_state.get('documents_data', [])
+        
+        # Initialize chat history management
+        self.initialize_chat_history()
+
+    def initialize_chat_history(self):
+        """Initialiseer chat geschiedenis management."""
+        if 'chat_sessions' not in st.session_state:
+            st.session_state['chat_sessions'] = {}
+        
+        if 'current_chat_id' not in st.session_state:
+            # Start met een nieuwe chat
+            self.create_new_chat()
+        
+        # Zorg ervoor dat de huidige chat bestaat
+        if st.session_state['current_chat_id'] not in st.session_state['chat_sessions']:
+            self.create_new_chat()
+
+    def create_new_chat(self) -> str:
+        """Maak een nieuwe chat sessie aan."""
+        chat_id = str(uuid.uuid4())[:8]
+        timestamp = datetime.now()
+        
+        st.session_state['chat_sessions'][chat_id] = {
+            'id': chat_id,
+            'title': f"Chat {timestamp.strftime('%d-%m %H:%M')}",
+            'messages': [{"role": "assistant", "content": "👋 Hallo! Stel gerust uw vragen over de beschikbare kennisbank."}],
+            'created_at': timestamp.isoformat(),
+            'last_activity': timestamp.isoformat()
+        }
+        
+        st.session_state['current_chat_id'] = chat_id
+        return chat_id
+
+    def switch_chat(self, chat_id: str):
+        """Wissel naar een andere chat sessie."""
+        if chat_id in st.session_state['chat_sessions']:
+            st.session_state['current_chat_id'] = chat_id
+        else:
+            st.error(f"Chat sessie {chat_id} bestaat niet meer.")
+
+    def delete_chat(self, chat_id: str):
+        """Verwijder een chat sessie."""
+        if chat_id in st.session_state['chat_sessions']:
+            del st.session_state['chat_sessions'][chat_id]
+            
+            # Als we de huidige chat verwijderen, maak een nieuwe aan
+            if st.session_state.get('current_chat_id') == chat_id:
+                self.create_new_chat()
+
+    def get_current_messages(self) -> List[Dict]:
+        """Verkrijg berichten van de huidige chat sessie."""
+        current_chat_id = st.session_state.get('current_chat_id')
+        if current_chat_id and current_chat_id in st.session_state['chat_sessions']:
+            return st.session_state['chat_sessions'][current_chat_id]['messages']
+        return []
+
+    def add_message_to_current_chat(self, role: str, content: str):
+        """Voeg een bericht toe aan de huidige chat sessie."""
+        current_chat_id = st.session_state.get('current_chat_id')
+        if current_chat_id and current_chat_id in st.session_state['chat_sessions']:
+            st.session_state['chat_sessions'][current_chat_id]['messages'].append({
+                "role": role, 
+                "content": content
+            })
+            # Update laatste activiteit
+            st.session_state['chat_sessions'][current_chat_id]['last_activity'] = datetime.now().isoformat()
+
+    def update_chat_title_if_needed(self, first_user_message: str):
+        """Update de chat titel gebaseerd op het eerste gebruikersbericht."""
+        current_chat_id = st.session_state.get('current_chat_id')
+        if current_chat_id and current_chat_id in st.session_state['chat_sessions']:
+            current_chat = st.session_state['chat_sessions'][current_chat_id]
+            
+            # Alleen updaten als het nog de standaard titel is
+            if current_chat['title'].startswith('Chat '):
+                # Neem eerste 30 karakters van het bericht als titel
+                new_title = first_user_message[:30]
+                if len(first_user_message) > 30:
+                    new_title += "..."
+                current_chat['title'] = new_title
 
     def setup_page_config(self):
         """Configureer de Streamlit pagina."""
         st.set_page_config(
             page_title="🔒 Private Kennisbank Chat",
-            page_icon="�",
+            page_icon="🤖",
             layout="wide",
             initial_sidebar_state="expanded"
         )
@@ -227,9 +309,74 @@ ANTWOORD:
         except Exception as e:
             return f"❌ Fout bij het genereren van het antwoord: {str(e)}"
 
-    def display_sidebar(self):
-        """Toon de sidebar voor bestandsbeheer en informatie."""
+    def display_chat_history_sidebar(self):
+        """Toon chat geschiedenis in de sidebar."""
         with st.sidebar:
+            st.header("💬 Chat Geschiedenis")
+            
+            # Nieuwe chat knop
+            if st.button("➕ Nieuwe Chat", use_container_width=True):
+                self.create_new_chat()
+                st.rerun()
+            
+            st.divider()
+            
+            # Sorteer chats op laatste activiteit (nieuwste eerst)
+            sorted_chats = sorted(
+                st.session_state['chat_sessions'].items(), 
+                key=lambda x: x[1]['last_activity'], 
+                reverse=True
+            )
+            
+            if sorted_chats:
+                current_chat_id = st.session_state.get('current_chat_id')
+                
+                for chat_id, chat_data in sorted_chats:
+                    col1, col2 = st.columns([4, 1])
+                    
+                    with col1:
+                        # Highlight huidige chat
+                        is_current = chat_id == current_chat_id
+                        button_label = f"{'🔸' if is_current else '💬'} {chat_data['title']}"
+                        
+                        if st.button(
+                            button_label, 
+                            key=f"chat_{chat_id}",
+                            disabled=is_current,
+                            use_container_width=True
+                        ):
+                            self.switch_chat(chat_id)
+                            st.rerun()
+                    
+                    with col2:
+                        # Verwijder knop (behalve voor huidige chat als het de enige is)
+                        can_delete = len(st.session_state['chat_sessions']) > 1 or chat_id != current_chat_id
+                        if can_delete and st.button("🗑️", key=f"delete_{chat_id}", help="Verwijder chat"):
+                            self.delete_chat(chat_id)
+                            st.rerun()
+                
+                # Chat statistieken
+                st.divider()
+                st.caption(f"💾 {len(sorted_chats)} chat sessie(s) opgeslagen")
+                
+                # Optie om alle chats te wissen
+                if len(sorted_chats) > 1:
+                    if st.button("🧹 Alle Chats Wissen", use_container_width=True):
+                        st.session_state['chat_sessions'] = {}
+                        self.create_new_chat()
+                        st.rerun()
+            else:
+                st.info("Geen chat geschiedenis beschikbaar.")
+
+    def display_sidebar(self):
+        """Toon de sidebar voor bestandsbeheer, chat geschiedenis en informatie."""
+        with st.sidebar:
+            # Chat geschiedenis sectie
+            self.display_chat_history_sidebar()
+            
+            st.divider()
+            
+            # Bestandsbeheer sectie
             st.header("📁 Kennisbank Management")
 
             uploaded_file = st.file_uploader(
@@ -248,13 +395,16 @@ ANTWOORD:
                 st.subheader("📊 Kennisbank Status")
                 st.metric("Aantal Documenten", f"{len(self.documents_data)}")
                 
-                if st.button("🧹 Kennisbank Wissen"):
-                    keys_to_delete = ['documents_data', 'document_embeddings_matrix', 'last_processed_file', 'messages']
+                if st.button("🧹 Kennisbank Wissen", use_container_width=True):
+                    keys_to_delete = ['documents_data', 'document_embeddings_matrix', 'last_processed_file']
                     for key in keys_to_delete:
                         if key in st.session_state:
                             del st.session_state[key]
                     st.rerun()
 
+            st.divider()
+            
+            # Privacy en technische informatie
             st.subheader("🔒 Privacy & Techniek")
             st.info(
                 "**Privacy-First:** Uw data wordt lokaal in uw browser-sessie verwerkt en niet opgeslagen op een server. "
@@ -270,26 +420,43 @@ ANTWOORD:
 
     def display_chat_interface(self):
         """Toon de hoofd-chatinterface."""
-        st.title("🔒 Private Kennisbank Chatbot")
+        # Header met huidige chat info
+        current_chat = st.session_state['chat_sessions'].get(st.session_state['current_chat_id'], {})
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.title("🔒 Private Kennisbank Chatbot")
+        with col2:
+            if current_chat:
+                st.caption(f"💬 {current_chat['title']}")
+        
         st.markdown("*Een veilige RAG-chatbot, compatibel met Streamlit Cloud, zonder externe database.*")
 
-        if "messages" not in st.session_state:
-            st.session_state.messages = [{"role": "assistant", "content": "👋 Hallo! Upload een kennisbank via de sidebar om te beginnen."}]
-
-        for message in st.session_state.messages:
+        # Toon berichten van huidige chat
+        messages = self.get_current_messages()
+        
+        for message in messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
+        # Chat input
         if prompt := st.chat_input("Stel uw vraag..."):
-            st.session_state.messages.append({"role": "user", "content": prompt})
+            # Voeg gebruikersbericht toe
+            self.add_message_to_current_chat("user", prompt)
+            
+            # Update chat titel als dit het eerste bericht is
+            user_messages = [m for m in messages if m["role"] == "user"]
+            if len(user_messages) == 0:  # Dit is het eerste gebruikersbericht
+                self.update_chat_title_if_needed(prompt)
+            
             with st.chat_message("user"):
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
                 if not self.documents_data:
-                    warning_msg = "⚠️ Geen kennisbank geladen. Upload eerst een bestand."
+                    warning_msg = "⚠️ Geen kennisbank geladen. Upload eerst een bestand via de sidebar."
                     st.warning(warning_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": warning_msg})
+                    self.add_message_to_current_chat("assistant", warning_msg)
                     return
 
                 with st.spinner("🧠 Denken..."):
@@ -297,13 +464,15 @@ ANTWOORD:
                     response = self.generate_response(prompt, similar_docs)
                     st.markdown(response)
                     
+                    # Toon bronnen als ze relevant genoeg zijn
                     valid_sources = [doc for doc in similar_docs if doc['similarity'] > self.SIMILARITY_THRESHOLD]
                     if valid_sources:
                         with st.expander("📚 Gebruikte bronnen"):
                             for doc in valid_sources:
                                 st.write(f"• **{doc['title']}** (Relevantie: {doc['similarity']:.1%})")
                 
-                st.session_state.messages.append({"role": "assistant", "content": response})
+                # Voeg assistant response toe aan chat
+                self.add_message_to_current_chat("assistant", response)
 
     def run(self):
         """Start de applicatie en orkestreer de UI."""
