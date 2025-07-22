@@ -304,25 +304,42 @@ ANTWOORD:
         with st.sidebar:
             st.header("📁 Kennisbank Management")
             
+            # Load from session if available (EERST controleren!)
+            if 'documents_data' in st.session_state and not self.documents_data:
+                self.documents_data = st.session_state['documents_data']
+                st.info(f"✅ Kennisbank herlaadt: {len(self.documents_data)} documenten")
+            
             # File upload
             uploaded_file = st.file_uploader(
                 "Upload Kennisbank (JSON)",
                 type="json",
-                help="Upload je private kennisbank JSON bestand"
+                help="Upload je private kennisbank JSON bestand",
+                key="json_uploader"  # Unieke key toegevoegd
             )
             
             if uploaded_file:
-                # Process documents
-                documents, result_msg = self.process_uploaded_documents(uploaded_file)
+                # Voorkom herverwerking van hetzelfde bestand
+                file_id = f"{uploaded_file.name}_{uploaded_file.size}"
                 
-                if documents:
-                    st.success(result_msg)
+                if st.session_state.get('last_processed_file') != file_id:
+                    # Process documents
+                    with st.spinner("📄 Verwerken van documenten..."):
+                        documents, result_msg = self.process_uploaded_documents(uploaded_file)
                     
-                    # Store in class
-                    self.documents_data = documents
-                    
-                    # Store in session for persistence
-                    st.session_state['documents_data'] = documents
+                    if documents:
+                        st.success(result_msg)
+                        
+                        # Store in BOTH class and session
+                        self.documents_data = documents
+                        st.session_state['documents_data'] = documents
+                        st.session_state['last_processed_file'] = file_id
+                        
+                        # Force rerun to update the interface
+                        st.rerun()
+                    else:
+                        st.error(result_msg)
+                else:
+                    st.info("✅ Bestand al verwerkt")
                     
                     # Show stats
                     st.subheader("📊 Statistieken")
@@ -341,38 +358,34 @@ ANTWOORD:
                 else:
                     st.error(result_msg)
             
-            # Load from session if available
-            if 'documents_data' in st.session_state and not self.documents_data:
-                self.documents_data = st.session_state['documents_data']
+            # Status check (DEBUG info)
+            st.subheader("🔍 Debug Status")
+            st.write(f"Documents in class: {len(self.documents_data)}")
+            st.write(f"Documents in session: {len(st.session_state.get('documents_data', []))}")
             
-            # Privacy info
-            st.subheader("🔒 Privacy Info")
-            st.info("""
-            **Streamlit Cloud Compatible:**
-            - ✅ Geen ChromaDB (SQLite issue opgelost)
-            - ✅ Session-based opslag
-            - ✅ Gevoelige data filtering  
-            - ✅ Lokale embeddings
-            - ✅ Privacy-first design
-            """)
+            # Show current stats if data exists
+            if self.documents_data:
+                st.subheader("📊 Statistieken")
+                categories = {}
+                for doc in self.documents_data:
+                    cat = doc.get('category', 'Onbekend')
+                    categories[cat] = categories.get(cat, 0) + 1
+                
+                for cat, count in categories.items():
+                    st.text(f"• {cat}: {count} documenten")
+                
+                # Show quality metrics
+                avg_content_length = np.mean([len(doc['content']) for doc in self.documents_data])
+                st.metric("Gem. artikel lengte", f"{avg_content_length:.0f} chars")
             
-            # System info
-            st.subheader("⚙️ Technische Info")
-            st.text("🤖 LLM: Groq Llama3-70B")
-            st.text("🔍 Embeddings: SentenceTransformers")
-            st.text("🗄️ Vector Store: In-Memory")
-            st.text("☁️ Platform: Streamlit Cloud")
-            
-            # Clear data button
-            if st.button("🧹 Clear Kennisbank"):
-                self.documents_data = []
+            # Load from session button (manual backup)
+            if st.button("🔄 Herlaad uit Session"):
                 if 'documents_data' in st.session_state:
-                    del st.session_state['documents_data']
-                if 'messages' in st.session_state:
-                    st.session_state.messages = [
-                        {"role": "assistant", "content": "Kennisbank is gewist. Upload een nieuw bestand om te beginnen."}
-                    ]
-                st.rerun()
+                    self.documents_data = st.session_state['documents_data']
+                    st.success(f"✅ {len(self.documents_data)} documenten herladen")
+                    st.rerun()
+                else:
+                    st.error("❌ Geen data in session gevonden")
     
     def display_header(self):
         """App header met informatie"""
@@ -409,6 +422,10 @@ ANTWOORD:
         # Access control
         if not self.check_access_control():
             return
+        
+        # Load documents from session on startup (BELANGRIJK!)
+        if 'documents_data' in st.session_state and not self.documents_data:
+            self.documents_data = st.session_state['documents_data']
         
         # Display app
         self.display_header()
